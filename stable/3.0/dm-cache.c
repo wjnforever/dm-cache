@@ -64,11 +64,14 @@
 #define DEFAULT_WRITE_POLICY WRITE_THROUGH
 
 /* Number of pages for I/O */
+/* 默认用于IO的Page数为1024 */
 #define DMCACHE_COPY_PAGES 1024
 
-/* States of a cache block */
+/* States of a cache block 缓存块状态(4位) */
 #define INVALID		0
 #define VALID		1	/* Valid */
+// src_dev/cache_dev的cache_block对应关系已经建立，但数据还没有写入cache_dev的cache_bloc
+// 表明cache_dev的这块cache_block已经分配出去了
 #define RESERVED	2	/* Allocated but data not in place yet */
 #define DIRTY		4	/* Locally modified */
 #define WRITEBACK	8	/* In the process of write back */
@@ -81,46 +84,58 @@
  * Cache context
  */
 struct cache_c {
-	struct dm_dev *src_dev;		/* Source device */
-	struct dm_dev *cache_dev;	/* Cache device */
-	struct dm_kcopyd_client *kcp_client; /* Kcopyd client for writing back data */
+	struct dm_dev *src_dev;		/* Source device 原始设备，磁盘 */
+	struct dm_dev *cache_dev;	/* Cache device 缓存设备，SSD设备 */
+	struct dm_kcopyd_client *kcp_client; /* Kcopyd client for writing back data kcopyd客户端，这里仅用于write_back */
 
-	struct cacheblock *cache;	/* Hash table for cache blocks */
-	sector_t size;			/* Cache size */
-	unsigned int bits;		/* Cache size in bits */
-	unsigned int assoc;		/* Cache associativity */
-	unsigned int block_size;	/* Cache block size */
-	unsigned int block_shift;	/* Cache block size in bits */
-	unsigned int block_mask;	/* Cache block mask */
-	unsigned int consecutive_shift;	/* Consecutive blocks size in bits */
-	unsigned long counter;		/* Logical timestamp of last access */
-	unsigned int write_policy;	/* Cache write policy */
-	sector_t dirty_blocks;		/* Number of dirty blocks */
+	// cache设备区域划分: data(size*block_size*512) | meta(size*sizeof(sector_t)) | meta_dmc(512)
+	// data区域: 0~(size-1) block_size
+	struct cacheblock *cache;	/* Hash table for cache blocks cacheblock哈希数组，元数个数为size */
+	sector_t size;			/* Cache size 默认为65536 2^16 */
+	unsigned int bits;		/* Cache size in bits 默认为16 */
+	// data区划分为物理连续的若干个set，每个set内包含assoc个cacheblock
+	// src_dev上的cacheblock通过hash找到对应的set，然后在set内查找cacheblock
+	unsigned int assoc;		/* Cache associativity set大小，默认为1024 */
 
-	spinlock_t lock;		/* Lock to protect page allocation/deallocation */
-	struct page_list *pages;	/* Pages for I/O */
-	unsigned int nr_pages;		/* Number of pages */
-	unsigned int nr_free_pages;	/* Number of free pages */
-	wait_queue_head_t destroyq;	/* Wait queue for I/O completion */
-	atomic_t nr_jobs;		/* Number of I/O jobs */
-	struct dm_io_client *io_client;   /* Client memory pool*/
+	unsigned int block_size;	/* Cache block size cacheblock块大小，单位为sector，默认为8(4KB) */
+	unsigned int block_shift;	/* Cache block size in bits cacheblock块大小位掩码3 */
+	unsigned int block_mask;	/* Cache block mask cacheblock块大小掩码7 */
+
+	unsigned int consecutive_shift;	/* Consecutive blocks size in bits 连续块大小位掩码，默认为10 */
+	unsigned long counter;		/* Logical timestamp of last access 最后访问时间 */
+	unsigned int write_policy;	/* Cache write policy 写策略，默认为0 write_through */
+	sector_t dirty_blocks;		/* Number of dirty blocks 脏cache_block数量 */
+
+	spinlock_t lock;		/* Lock to protect page allocation/deallocation 页保护锁 */
+	struct page_list *pages;	/* Pages for I/O 用于IO的page_list列表，默认1024项.{page_list *next,page*page} */
+	unsigned int nr_pages;		/* Number of pages 总Page数，默认1024 */
+	unsigned int nr_free_pages;	/* Number of free pages 空闲Page数目 */
+	wait_queue_head_t destroyq;	/* Wait queue for I/O completion 等待队列头 */
+	atomic_t nr_jobs;		/* Number of I/O jobs io job数 */
+	struct dm_io_client *io_client;   /* Client memory pool dm-io客户端 */
 
 	/* Stats */
 	unsigned long reads;		/* Number of reads */
 	unsigned long writes;		/* Number of writes */
-	unsigned long cache_hits;	/* Number of cache hits */
-	unsigned long replace;		/* Number of cache replacements */
-	unsigned long writeback;	/* Number of replaced dirty blocks */
-	unsigned long dirty;		/* Number of submitted dirty blocks */
+	unsigned long cache_hits;	/* Number of cache hits 命中次数 */
+	unsigned long replace;		/* Number of cache replacements 替换次数 */
+	unsigned long writeback;	/* Number of replaced dirty blocks 替换脏块的数量 */
+	unsigned long dirty;		/* Number of submitted dirty blocks 提交脏块的数量 */
 };
 
 /* Cache block metadata structure */
 struct cacheblock {
-	spinlock_t lock;	/* Lock to protect operations on the bio list */
-	sector_t block;		/* Sector number of the cached block */
-	unsigned short state;	/* State of a block */
-	unsigned long counter;	/* Logical timestamp of the block's last access */
-	struct bio_list bios;	/* List of pending bios */
+	spinlock_t lock;	/* Lock to protect operations on the bio list 保护锁 */
+	sector_t block;		/* Sector number of the cached block 此cacheblock对应的src_dev起始扇区号 */
+	unsigned short state;	/* State of a block cacheblock的状态 */
+	unsigned long counter;	/* Logical timestamp of the block's last access 最后访问时间(访问次数) */
+	struct bio_list bios;	/* List of pending bios 阻塞的bio请求链表 */
+};
+
+struct dm_io_region {
+    struct block_device *bdev;   /* 设备信息 */
+    sector_t sector;             /* 起始扇区 */
+    sector_t count;              /* If this is zero the region is ignored. 读写扇区数目 */
 };
 
 /* Structure for a kcached job */
@@ -141,19 +156,31 @@ struct kcached_job {
 	struct page_list *pages;
 };
 
-
+// 读写分为以下两类
+// 1）磁盘跟内存的交互
+// dm_io_sync_vm: 同步
+// dm_io_async_bvec: 异步
+// 2）磁盘跟磁盘的交互
+// copy_block
+//   dm_kcopyd_copy
 /****************************************************************************
  *  Wrapper functions for using the new dm_io API
  ****************************************************************************/
+// 磁盘《-》内存读写的接口，同步执行，用于cache设备上meta数据的读写
+// where: 读写的目标设备及读写范围
+// rw: 读写
+// data: 内存空间
+// dmc: dm-cache设备在内核的管理结构
 static int dm_io_sync_vm(unsigned int num_regions, struct dm_io_region
 	*where, int rw, void *data, unsigned long *error_bits, struct cache_c *dmc)
 {
 	struct dm_io_request iorq;
 
+	// 同步虚拟内存io
 	iorq.bi_rw= rw;
 	iorq.mem.type = DM_IO_VMA;
 	iorq.mem.ptr.vma = data;
-	iorq.notify.fn = NULL;
+	iorq.notify.fn = NULL;   // 表明dm_io_sync_vm是同步的
 	iorq.client = dmc->io_client;
 
 	return dm_io(&iorq, num_regions, where, error_bits);
@@ -166,6 +193,7 @@ static int dm_io_async_bvec(unsigned int num_regions, struct dm_io_region
 	struct cache_c *dmc = job->dmc;
 	struct dm_io_request iorq;
 
+	// 异步bio向量io
 	iorq.bi_rw = (rw | (1 << REQ_SYNC));
 	iorq.mem.type = DM_IO_BVEC;
 	iorq.mem.ptr.bvec = bvec;
@@ -298,18 +326,31 @@ static struct work_struct _kcached_work;
 
 static inline void wake(void)
 {
+	// 将工作(_kcached_work)加入工作队列(_kcached_wq)
 	queue_work(_kcached_wq, &_kcached_work);
 }
 
+// 最少job数目
 #define MIN_JOBS 1024
 
+// job缓存cache
 static struct kmem_cache *_job_cache;
+// job池
 static mempool_t *_job_pool;
 
+// 链表保护自旋锁
 static DEFINE_SPINLOCK(_job_lock);
 
+// 等待完成IO的job链表
+// _complete_job链表中的任务是需要进行善后处理的，包括将使用的页面重新回收到“kcached客户端”的页面池中，并将kcached任务从链表中取出，并释放
+// 最终调用“客户端”内核模块指定的回调函数(job内有这个吗???)
 static LIST_HEAD(_complete_jobs);
+// 等待执行io的链表
+// 任务刚开始加入到_ios_jobs链表时，rw标志为读，一旦调度，将从拷贝源读取数据到任务的页面，然后通过设定的回调函数将rw标志改为写，并重新插入到_ios_jobs链表
+// 再次调度时，会将job的Page中的数据拷贝到所有的拷贝目标，在完成之后，回调函数把这个任务又转移到 _complete_jobs链表
 static LIST_HEAD(_io_jobs);
+// 等待分配page的IO链表
+// 任务刚提交时，被加入到_pages_jobs链表，在从“kcached客户端”的页面池中分配所需个数的页面后，这个任务会转移到_ios_jobs链表
 static LIST_HEAD(_pages_jobs);
 
 static int jobs_init(void)
@@ -686,7 +727,8 @@ static int do_complete(struct kcached_job *job)
 
 	flush_bios(job->cacheblock);
 	mempool_free(job, _job_pool);
-
+	
+	// dmc设备job个数为0
 	if (atomic_dec_and_test(&job->dmc->nr_jobs))
 		wake_up(&job->dmc->destroyq);
 
@@ -786,6 +828,13 @@ static void copy_callback(int read_err, unsigned int write_err, void *context)
 	flush_bios(cacheblock);
 }
 
+// 磁盘《-》磁盘之间交互
+// int dm_kcopyd_copy(struct dm_kcopyd_client *kc, struct dm_io_region *from,
+//              unsigned num_dests, struct dm_io_region *dests,
+//              unsigned flags, dm_kcopyd_notify_fn fn, void *context);
+// dmc->kcp_client: kcopyd异步拷贝服务时，必须先创建一个对应的client，在cache_ctr中创建
+// dm_kcopyd_notify_fn: kcopyd处理完请求的回调函数
+// cacheblock: 回调函数参数
 static void copy_block(struct cache_c *dmc, struct dm_io_region src,
 	                   struct dm_io_region dest, struct cacheblock *cacheblock)
 {
@@ -870,6 +919,8 @@ static void cache_reset_counter(struct cache_c *dmc)
  *      WRITEBACK).
  *
  */
+// 入参block: srv_dev的cacheblock序号
+// 出参cache_block: cache_dev的cacheblock序号
 static int cache_lookup(struct cache_c *dmc, sector_t block,
 	                    sector_t *cache_block)
 {
@@ -883,7 +934,9 @@ static int cache_lookup(struct cache_c *dmc, sector_t block,
 
 	index=set_number * cache_assoc;
 
+	// 本set内查找
 	for (i=0; i<cache_assoc; i++, index++) {
+		// 
 		if (is_state(cache[index].state, VALID) ||
 		    is_state(cache[index].state, RESERVED)) {
 			if (cache[index].block == block) {
@@ -939,6 +992,8 @@ static int cache_lookup(struct cache_c *dmc, sector_t block,
 /*
  * Insert a block into the cache (in the frame specified by cache_block).
  */
+// block: src_dev的cache_block
+// cache_block: cache_dev的cache_block，对应到dmc->cache[cache_block]
 static int cache_insert(struct cache_c *dmc, sector_t block,
 	                    sector_t cache_block)
 {
@@ -948,6 +1003,7 @@ static int cache_insert(struct cache_c *dmc, sector_t block,
        not in place until kcopyd finishes its job.
 	 */
 	cache[cache_block].block = block;
+	// 注意RESERVED这个状态是独立存在的
 	cache[cache_block].state = RESERVED;
 	if (dmc->counter == ULONG_MAX) cache_reset_counter(dmc);
 	cache[cache_block].counter = ++dmc->counter;
@@ -1202,6 +1258,9 @@ static int cache_miss(struct cache_c *dmc, struct bio* bio, sector_t cache_block
 /*
  * Decide the mapping and perform necessary cache operations for a bio request.
  */
+// 上层的IO请求由Device Mapper框架切割为cacheblock大小(且对齐)的bio, 然后交由dm-cache处理
+// 也就是说, 不管是对SSD, 还是普通磁盘, dm-cache处理IO的单位都是cacheblock
+// 这里bio读写范围都是对src_dev而言
 static int cache_map(struct dm_target *ti, struct bio *bio,
 		      union map_info *map_context)
 {
@@ -1209,7 +1268,9 @@ static int cache_map(struct dm_target *ti, struct bio *bio,
 	sector_t request_block, cache_block = 0, offset;
 	int res;
 
+	// bio读写区域在cacheblock内的偏移(sector单位)
 	offset = bio->bi_sector & dmc->block_mask;
+	// bio读写区域转化到src_dev的cacheblock序号
 	request_block = bio->bi_sector - offset;
 
 	DPRINTK("Got a %s for %llu ((%llu:%llu), %u bytes)",
@@ -1248,6 +1309,7 @@ struct meta_dmc {
 static int load_metadata(struct cache_c *dmc) {
 	struct dm_io_region where;
 	unsigned long bits;
+	// cache设备大小(sector单位)
 	sector_t dev_size = dmc->cache_dev->bdev->bd_inode->i_size >> 9;
 	sector_t meta_size, *meta_data, i, j, index = 0, limit, order;
 	struct meta_dmc *meta_dmc;
@@ -1260,6 +1322,7 @@ static int load_metadata(struct cache_c *dmc) {
 	}
 
 	where.bdev = dmc->cache_dev->bdev;
+	// meta_dmc保存在cache设备最后一个sector
 	where.sector = dev_size - 1;
 	where.count = 1;
 	dm_io_sync_vm(1, &where, READ, meta_dmc, &bits, dmc);
@@ -1311,6 +1374,10 @@ static int load_metadata(struct cache_c *dmc) {
 	   required by dm-io for bookeeping.)
 	 */
 	limit = (BIO_MAX_PAGES - 2) * (PAGE_SIZE >> SECTOR_SHIFT);
+	// static inline unsigned long to_bytes(sector_t n)
+	// {
+	// 	return (n << SECTOR_SHIFT);
+	// }
 	meta_data = (sector_t *)vmalloc(to_bytes(min(meta_size, limit)));
 	if (!meta_data) {
 		DMERR("load_metadata: Unable to allocate memory");
@@ -1429,6 +1496,33 @@ static int dump_metadata(struct cache_c *dmc) {
  *  arg[5]: cache associativity
  *  arg[6]: write caching policy
  */
+// 在设备创建时，DM框架会自动创建对应的struct dm_target结构，并力所能及地初始化了一些成员
+// 带@标记的成员由DM初始化，或者部分初始化，其他初始化工作由ctr完成
+// struct dm_target {
+// 	struct dm_table *table;   // @driver 到 target device 的映射表，由DM框架维护
+// 	struct target_type *type; // @driver 所注册的那个type
+// 	/* target limits */
+// 	sector_t begin;           // @<start>
+// 	sector_t len;             // @<length>
+// 	/* Always a power of 2 */
+// 	sector_t split_io;        // 块大小（每个块的扇区数）
+// 	/*
+// 	 * A number of zero-length barrier requests that will be submitted
+// 	 * to the target for the purpose of flushing cache.
+// 	 *
+// 	 * The request number will be placed in union map_info->flush_request.
+// 	 * It is a responsibility of the target driver to remap these requests
+// 	 * to the real underlying devices.
+// 	 */
+// 	unsigned num_flush_requests;
+// 	/* target specific data */
+// 	void *private;            // 自定义的设备相关数据
+// 	/* Used to provide an error string from the ctr */
+// 	char *error;
+// };
+// cache_ctr所要做的就是完成对该结构的初始化，主要做两件事：
+// 1. 将源设备(argv[0]/argv[1])的dev信息记录到table中，关键就是记住源设备的dev结构，DM中统一用struct dm_dev *指针来引用
+// 2. 将target device(s)的信息初始化并记录在private中，这里是把所有信息保存到cache_c，然后赋值给private
 static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct cache_c *dmc;
@@ -1450,6 +1544,7 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 	}
 
+	// 将path所指定的设备的bdev以及对应的区间、权限、模式等填入ti->table中
 	r = dm_get_device(ti, argv[0],
 			  dm_table_get_mode(ti->table), &dmc->src_dev);
 	if (r) {
@@ -1496,6 +1591,7 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			r = -EINVAL;
 			goto bad6;
 		}
+		// 从Cache设备成功读取meta信息
 		goto init; /* Skip reading cache parameters from command line */
 	} else if (persistence != 0) {
 			ti->error = "dm-cache: Invalid cache persistence";
@@ -1552,8 +1648,11 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		dmc->assoc = DEFAULT_CACHE_ASSOC;
 
 	DMINFO("%lld", dmc->cache_dev->bdev->bd_inode->i_size);
+	// Cache设备大小(sector个数)
 	dev_size = dmc->cache_dev->bdev->bd_inode->i_size >> 9;
+	// Cache设备上用作cacheblock区占用的sector个数
 	data_size = dmc->size * dmc->block_size;
+	// Cache设备上用作meta区占用sector个数
 	meta_size = dm_div_up(dmc->size * sizeof(sector_t), 512) + 1;
 	if ((data_size + meta_size) > dev_size) {
 		DMERR("Requested cache size exeeds the cache device's capacity" \
@@ -1564,8 +1663,10 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		r = -EINVAL;
 		goto bad6;
 	}
+	// 默认dmc->assoc大小为1024(DEFAULT_CACHE_ASSOC)，但CONSECUTIVE_BLOCKS是512，导致consecutive_blocks等于512???
 	consecutive_blocks = dmc->assoc < CONSECUTIVE_BLOCKS ?
 	                     dmc->assoc : CONSECUTIVE_BLOCKS;
+	// 这个consecutive_shift用在hash，其实没太大用???
 	dmc->consecutive_shift = ffs(consecutive_blocks) - 1;
 
 	if (argc >= 7) {
@@ -1618,6 +1719,9 @@ init:	/* Initialize the cache structs */
 	dmc->writeback = 0;
 	dmc->dirty = 0;
 
+	// dm层将IO分发为指定大小下发到dm_target设备
+	// 由于设置了ti->split_io为block_size，所以cache_map接收到的数据都不会超过block_size
+	// bio在dm层被拆分成最大block_size的bio下发
 	ti->split_io = dmc->block_size;
 	ti->private = dmc;
 	return 0;
@@ -1747,6 +1851,13 @@ int __init dm_cache_init(void)
 	if (r)
 		return r;
 
+    // 工作队列(work queue)是Linux kernel中将工作推后执行的一种机制。
+    // 这种机制和BH或Tasklets不同之处在于工作队列是把推后的工作交由一个内核线程去执行，
+    // 因此工作队列的优势就在于它允许重新调度甚至睡眠。
+	// 仿照kcopyd(内核拷贝进程)创建的内核线程，主要处理
+	// 1）等待页面的任务链表 _pages_jobs
+	// 2）有页面、等待发起I/O的任务_io_jobs
+	// 3）已经完成的任务_complete_jobs
 	_kcached_wq = create_singlethread_workqueue("kcached");
 	if (!_kcached_wq) {
 		DMERR("failed to start kcached");
@@ -1754,6 +1865,7 @@ int __init dm_cache_init(void)
 	}
 	INIT_WORK(&_kcached_work, do_work);
 
+	// 注册target driver到DM层
 	r = dm_register_target(&cache_target);
 	if (r < 0) {
 		DMERR("cache: register failed %d", r);
