@@ -1,0 +1,10 @@
+
+其中最重要的域是bi_io_vec，bi_vcnt，bi_idx
+bi_io_vec是一个指针，指向一个bio_vec数组，每个bio_vec结构体对应一个segment，一个segment由一个或者多个物理上连续的buffer组成
+bi_vcnt是bi_io_vec数组的长度
+bi_idx是当前正在进行I/O操作bio_vec对象的索引
+struct bio_vec {
+    struct page *bv_page;       //段所在的页的描述符
+    unsigned int    bv_len;       //段长
+    unsigned int    bv_offset;  //段在页中的偏移位置
+};
